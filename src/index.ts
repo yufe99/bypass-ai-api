@@ -292,19 +292,25 @@ async function humanizePipeline(originalText: string, mode: "standard" | "academ
   let result = processedText;
   try {
     if (mode === "academic") {
+      // Academic: EN → CN → JP → FI → EN (4 hops via DeepSeek for consistency)
       const cn = await callDeepSeek(result, "Translate to simplified Chinese. PRESERVE all [[REF_n]] and [[TERM_n]] placeholders exactly as-is.", env.DEEPSEEK_API_KEY);
       const jp = await callDeepSeek(cn, "Translate to Japanese. PRESERVE all placeholders exactly.", env.DEEPSEEK_API_KEY);
-      const fi = await callTranslationAPI(jp, "ja", "fi", env.GOOGLE_TRANSLATE_KEY);
+      // Use DeepSeek for FI translation too (avoids NIU Trans 404 / Google Translate API key requirement)
+      const fi = await callDeepSeek(jp, "Translate to Finnish (suomi). PRESERVE all [[REF_n]] and [[TERM_n]] placeholders exactly.", env.DEEPSEEK_API_KEY);
       result = await callDeepSeek(fi, `Task: Translate Finnish text back to professional English.
 Reference (original meaning): "${processedText.slice(0, 500)}"
-Style: HIGH BURSTINESS, HIGH PERPLEXITY.
-Avoid: delve, testament, comprehensive, intricate, showcases, multifaceted, it is worth noting, in conclusion, further research is needed.
+Style: HIGH BURSTINESS (mix short punchy sentences with longer flowing ones), HIGH PERPLEXITY (varied vocabulary, avoid repetition).
+Avoid these AI clichés: delve, testament, comprehensive, intricate, showcases, multifaceted, it is worth noting, in conclusion, further research is needed.
 CRUCIAL: Keep ALL [[REF_n]] and [[TERM_n]] placeholders exactly as-is.
 Output ONLY the translated English text.`, env.DEEPSEEK_API_KEY);
     } else if (mode === "creative") {
-      const fi = await callTranslationAPI(result, "en", "fi", env.GOOGLE_TRANSLATE_KEY);
-      result = await callDeepSeek(fi, `Task: Translate to English with HIGH CREATIVITY. Avoid: delve, testament, comprehensive, intricate, showcases. Output ONLY the translated English text.`, env.DEEPSEEK_API_KEY);
+      // Creative: EN → FI → EN via DeepSeek
+      const fi = await callDeepSeek(result, "Translate to Finnish (suomi). PRESERVE all placeholders exactly.", env.DEEPSEEK_API_KEY);
+      result = await callDeepSeek(fi, `Task: Translate to English with HIGH CREATIVITY. Vary sentence length, use unexpected word choices, avoid repetition.
+Avoid AI clichés: delve, testament, comprehensive, intricate, showcases.
+Output ONLY the translated English text.`, env.DEEPSEEK_API_KEY);
     } else {
+      // Standard: EN → CN → EN
       const cn = await callDeepSeek(result, "Translate to Chinese naturally. Keep placeholders as-is.", env.DEEPSEEK_API_KEY);
       result = await callDeepSeek(cn, "Translate back to English. Make it sound genuinely human-written. Avoid AI clichés.", env.DEEPSEEK_API_KEY);
     }
@@ -316,16 +322,24 @@ Output ONLY the translated English text.`, env.DEEPSEEK_API_KEY);
 
 async function getAIScore(text: string, apiKey: string): Promise<number | null> {
   try {
-    const res = await fetch("https://api-inference.huggingface.co/models/followsci/bert-ai-text-detector", {
-      method: "POST",
-      headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
-      body: JSON.stringify({ inputs: text }),
-      signal: AbortSignal.timeout(15000),
-    });
+    // HF Inference API: api-inference.huggingface.co was deprecated; use router.huggingface.co
+    // followsci/bert-ai-text-detector is no longer supported by hf-inference provider,
+    // switch to Hello-SimpleAI/chatgpt-detector-roberta (returns label "ChatGPT" / "Human")
+    const res = await fetch(
+      "https://router.huggingface.co/hf-inference/models/Hello-SimpleAI/chatgpt-detector-roberta",
+      {
+        method: "POST",
+        headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ inputs: text }),
+        signal: AbortSignal.timeout(15000),
+      }
+    );
     if (!res.ok) return null;
     const data = (await res.json()) as Array<Array<{ label: string; score: number }>>;
+    // Response shape: [[{label: "ChatGPT", score: 0.92}, {label: "Human", score: 0.08}]]
+    // We return the "ChatGPT"/AI probability (0-1)
     if (Array.isArray(data) && data[0] && Array.isArray(data[0])) {
-      const aiEntry = data[0].find((e) => e.label === "LABEL_1" || /ai/i.test(e.label));
+      const aiEntry = data[0].find((e) => /chatgpt|ai/i.test(e.label));
       return aiEntry ? aiEntry.score : null;
     }
     return null;
