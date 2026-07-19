@@ -13,10 +13,13 @@ PAYPAL_ENV = "sandbox"
 PAYPAL_PLAN_PRO = "P-9H8685126A247253XNJOLYFI"
 PAYPAL_PLAN_ACADEMIC = "P-16D99338NM5834927NJOLYFI"
 
+# PayPal Webhook ID (created via /v1/notifications/webhooks)
+PAYPAL_WEBHOOK_ID = "1K741337DT3618449"
+
 # Secrets (set via `wrangler secret put`):
 #   PAYPAL_CLIENT_ID
 #   PAYPAL_CLIENT_SECRET
+#   PAYPAL_WEBHOOK_ID_OVERRIDE (optional, for signature verification in production)
 #   DEEPSEEK_API_KEY
 #   HUGGINGFACE_API_KEY
 #   GOOGLE_TRANSLATE_KEY
-#   PAYPAL_WEBHOOK_ID (optional, for signature verification)

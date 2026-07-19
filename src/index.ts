@@ -388,7 +388,20 @@ export default {
       }
     }
 
-    // ===== GET /subscription/:id =====
+    // ===== GET /subscription/store/:id (debug — internal storage) =====
+    // 注意: Worker 实例重启会清空 in-memory store,生产应该用 KV/D1
+    if (url.pathname.startsWith("/subscription/store/") && request.method === "GET") {
+      const subId = url.pathname.split("/")[3];
+      const stored = subscriptionStore.get(subId);
+      return jsonResponse(
+        stored ? { subscriptionId: subId, ...stored } : { subscriptionId: subId, status: "not_found" },
+        200,
+        origin,
+        env
+      );
+    }
+
+    // ===== GET /subscription/:id (PayPal lookup) =====
     if (url.pathname.startsWith("/subscription/") && request.method === "GET") {
       try {
         if (!env.PAYPAL_CLIENT_ID) return jsonResponse({ error: "PayPal not configured" }, 503, origin, env);
@@ -409,11 +422,19 @@ export default {
     if (url.pathname === "/webhooks/paypal" && request.method === "POST") {
       try {
         const event = (await request.json()) as {
+          id?: string;
           event_type: string;
           resource: { id: string; plan_id?: string; status?: string };
         };
 
-        console.log(`PayPal webhook: ${event.event_type} ${event.resource.id}`);
+        // 基础验证：拒绝明显伪造的请求
+        // 生产环境应该用 PAYPAL-TRANSMISSION-SIG + cert_url 验证签名
+        // 这里只做存在性 + 格式检查，避免无效请求污染存储
+        if (!event.event_type || !event.resource?.id) {
+          return jsonResponse({ error: "Invalid event payload" }, 400, origin, env);
+        }
+
+        console.log(`[PayPal Webhook] ${event.event_type} → ${event.resource.id} (event: ${event.id || "n/a"})`);
 
         switch (event.event_type) {
           case "BILLING.SUBSCRIPTION.CREATED":
@@ -424,6 +445,7 @@ export default {
               status: event.resource.status || "unknown",
               createdAt: Date.now(),
             });
+            console.log(`[PayPal] Subscription ${event.resource.id} → ${event.resource.status}`);
             break;
           case "BILLING.SUBSCRIPTION.CANCELLED":
           case "BILLING.SUBSCRIPTION.SUSPENDED":
@@ -431,15 +453,29 @@ export default {
             const existing = subscriptionStore.get(event.resource.id);
             if (existing) {
               existing.status = event.resource.status || "cancelled";
+              console.log(`[PayPal] Subscription ${event.resource.id} → ${event.resource.status}`);
+            } else {
+              subscriptionStore.set(event.resource.id, {
+                plan: event.resource.plan_id || "unknown",
+                status: event.resource.status || "cancelled",
+                createdAt: Date.now(),
+              });
             }
             break;
           case "PAYMENT.SALE.COMPLETED":
-            console.log(`Payment received for subscription ${event.resource.id}`);
+          case "PAYMENT.CAPTURE.COMPLETED":
+            console.log(`[PayPal] Payment received for ${event.resource.id}`);
+            break;
+          case "PAYMENT.SALE.REVERSED":
+          case "PAYMENT.CAPTURE.DENIED":
+          case "BILLING.SUBSCRIPTION.PAYMENT.FAILED":
+            console.log(`[PayPal] Payment issue for ${event.resource.id}: ${event.event_type}`);
             break;
         }
 
-        return jsonResponse({ received: true }, 200, origin, env);
+        return jsonResponse({ received: true, eventType: event.event_type }, 200, origin, env);
       } catch (error) {
+        console.error("[PayPal Webhook] Error:", error);
         return jsonResponse({ error: error instanceof Error ? error.message : "Internal error" }, 500, origin, env);
       }
     }
