@@ -1,0 +1,6 @@
+# local secrets (gitignored) — copy to .dev.vars and fill in real values
+DEEPSEEK_API_KEY=
+HUGGINGFACE_API_KEY=
+GOOGLE_TRANSLATE_KEY=
+ALLOWED_ORIGIN=http://localhost:3000
+ENVIRONMENT=development

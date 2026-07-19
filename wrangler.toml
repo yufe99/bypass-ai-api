@@ -1,0 +1,15 @@
+name = "bypass-ai-api"
+main = "src/index.ts"
+compatibility_date = "2026-07-19"
+compatibility_flags = ["nodejs_compat"]
+
+# 只允许自家前端域名调（生产）
+[vars]
+ALLOWED_ORIGIN = "https://bypass-ai.pages.dev"
+ENVIRONMENT = "production"
+
+# 速率限制（v1: 游客模式，IP 维度，CF 提供）
+# Turnstile 验证（防滥用）
+# DEEPSEEK_API_KEY → 真实 key 在部署时用 `wrangler secret put DEEPSEEK_API_KEY` 设置
+# HUGGINGFACE_API_KEY → 同上
+# GOOGLE_TRANSLATE_KEY → 同上

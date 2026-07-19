@@ -1,0 +1,17 @@
+{
+  "name": "bypass-ai-api",
+  "version": "1.0.0",
+  "private": true,
+  "description": "BypassAI.online backend — Guardrail-protected multi-language rewriting pipeline",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "tail": "wrangler tail",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20240620.0",
+    "typescript": "^5",
+    "wrangler": "^3"
+  }
+}
