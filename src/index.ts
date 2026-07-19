@@ -1,41 +1,48 @@
 /**
- * BypassAI.online — Core API
+ * BypassAI.online — Core API + PayPal Subscriptions
  *
  * Routes:
- *   POST /humanize  — full Guardrail + multi-language rewrite pipeline
- *   POST /score     — AI probability score (HuggingFace)
- *   GET  /health    — liveness check
- *
- * Architecture (per the handover doc):
- *   Layer 1 (Guardrail): protect citations & technical terms
- *   Layer 2-3 (Rewrite): 3-mode multi-language pipeline
- *     - Standard: EN → CN → EN
- *     - Creative: EN → FI → EN
- *     - Academic: EN → CN → JP → FI → EN (4 hops, Guardrail preserved)
- *   Layer 4 (Restore): put protected terms back verbatim
- *   Then: AI score check (HuggingFace followsci/bert-ai-text-detector)
+ *   POST /humanize       — full Guardrail + multi-language rewrite pipeline
+ *   POST /score          — AI probability score (HuggingFace)
+ *   POST /subscribe      — create PayPal subscription, return approval URL
+ *   POST /webhooks/paypal — handle PayPal subscription events
+ *   GET  /health         — liveness check
  */
 
 export interface Env {
+  // Humanize
   DEEPSEEK_API_KEY: string;
   HUGGINGFACE_API_KEY: string;
   GOOGLE_TRANSLATE_KEY?: string;
+
+  // PayPal
+  PAYPAL_CLIENT_ID: string;
+  PAYPAL_CLIENT_SECRET: string;
+  PAYPAL_ENV: "sandbox" | "live";
+  PAYPAL_PLAN_PRO: string;
+  PAYPAL_PLAN_ACADEMIC: string;
+  PAYPAL_WEBHOOK_ID?: string;
+
   ALLOWED_ORIGIN: string;
   ENVIRONMENT: string;
 }
 
+const PAYPAL_API = (env: Env) =>
+  env.PAYPAL_ENV === "live"
+    ? "https://api-m.paypal.com"
+    : "https://api-m.sandbox.paypal.com";
+
 // ===============================
-// CORS — locked to allowed origin only
+// CORS
 // ===============================
 function corsHeaders(origin: string, allowed: string): HeadersInit {
-  // 严格匹配，不允许通配符
   const allowOrigin = origin === allowed ? origin : allowed;
   return {
     "Access-Control-Allow-Origin": allowOrigin,
     "Access-Control-Allow-Methods": "POST, GET, OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type",
+    "Access-Control-Allow-Headers": "Content-Type, PayPal-Auth-Assertion",
     "Access-Control-Max-Age": "86400",
-    "Vary": "Origin",
+    Vary: "Origin",
   };
 }
 
@@ -50,7 +57,28 @@ function jsonResponse(data: unknown, status: number, origin: string, env: Env): 
 }
 
 // ===============================
-// Layer 1: Term Protection (Guardrail)
+// PayPal: get access token
+// ===============================
+async function getPayPalToken(env: Env): Promise<string> {
+  const auth = btoa(`${env.PAYPAL_CLIENT_ID}:${env.PAYPAL_CLIENT_SECRET}`);
+  const res = await fetch(`${PAYPAL_API(env)}/v1/oauth2/token`, {
+    method: "POST",
+    headers: {
+      Authorization: `Basic ${auth}`,
+      "Content-Type": "application/x-www-form-urlencoded",
+    },
+    body: "grant_type=client_credentials",
+  });
+  if (!res.ok) {
+    const err = await res.text().catch(() => "");
+    throw new Error(`PayPal auth failed: ${res.status} ${err.slice(0, 200)}`);
+  }
+  const data = (await res.json()) as { access_token: string };
+  return data.access_token;
+}
+
+// ===============================
+// Layer 1: Term Protection
 // ===============================
 interface GuardrailState {
   processedText: string;
@@ -60,10 +88,7 @@ interface GuardrailState {
 function protectTerms(text: string): GuardrailState {
   const protectedMap = new Map<string, string>();
   let counter = 0;
-
-  // 保护参考文献: [12], [1-3], (Smith et al., 2023)
   const citationRegex = /(\[\d+[\d\s\-,]*\]|\([A-Z][a-z]+(\s+et\s+al\.)?,\s+\d{4}\))/g;
-  // 保护专业术语: PCSK9, LDL-C, ASCVD, GPT-4 等
   const techTermRegex = /\b([A-Z]{2,}\d*(-[A-Z0-9]+)*)\b/g;
 
   let processed = text.replace(citationRegex, (match) => {
@@ -81,7 +106,6 @@ function protectTerms(text: string): GuardrailState {
   return { processedText: processed, protectedMap };
 }
 
-// Layer 4: Term Restoration
 function restoreTerms(text: string, protectedMap: Map<string, string>): string {
   let result = text;
   for (const [id, original] of protectedMap.entries()) {
@@ -91,24 +115,15 @@ function restoreTerms(text: string, protectedMap: Map<string, string>): string {
 }
 
 // ===============================
-// DeepSeek V3 call
+// DeepSeek
 // ===============================
-async function callDeepSeek(
-  content: string,
-  systemPrompt: string,
-  apiKey: string,
-  timeoutMs = 30000
-): Promise<string> {
+async function callDeepSeek(content: string, systemPrompt: string, apiKey: string): Promise<string> {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-
+  const timer = setTimeout(() => controller.abort(), 30000);
   try {
     const response = await fetch("https://api.deepseek.com/v1/chat/completions", {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Authorization": `Bearer ${apiKey}`,
-      },
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
       body: JSON.stringify({
         model: "deepseek-chat",
         messages: [
@@ -120,15 +135,11 @@ async function callDeepSeek(
       }),
       signal: controller.signal,
     });
-
     if (!response.ok) {
       const errBody = await response.text().catch(() => "");
       throw new Error(`DeepSeek ${response.status}: ${errBody.slice(0, 200)}`);
     }
-
-    const data = (await response.json()) as {
-      choices?: Array<{ message?: { content?: string } }>;
-    };
+    const data = (await response.json()) as { choices?: Array<{ message?: { content?: string } }> };
     const text = data.choices?.[0]?.message?.content;
     if (!text) throw new Error("DeepSeek returned empty content");
     return text.trim();
@@ -137,16 +148,7 @@ async function callDeepSeek(
   }
 }
 
-// ===============================
-// Translation (NIU Trans → Google fallback)
-// ===============================
-async function callTranslationAPI(
-  text: string,
-  fromLang: string,
-  toLang: string,
-  googleKey?: string
-): Promise<string> {
-  // Try NIU Trans (free tier, no key)
+async function callTranslationAPI(text: string, fromLang: string, toLang: string, googleKey?: string): Promise<string> {
   try {
     const res = await fetch(
       `https://api.niutrans.com/trans?text=${encodeURIComponent(text)}&from=${fromLang}&to=${toLang}`,
@@ -157,145 +159,72 @@ async function callTranslationAPI(
       if (data.data) return data.data;
     }
   } catch {
-    // fall through to Google
+    // fall through
   }
-
-  // Fallback to Google Translate
-  if (!googleKey) {
-    throw new Error("Translation failed and no Google fallback key configured");
-  }
-
-  const res = await fetch(
-    `https://translation.googleapis.com/language/translate/v2?key=${googleKey}`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        q: text,
-        source: fromLang,
-        target: toLang,
-        format: "text",
-      }),
-      signal: AbortSignal.timeout(10000),
-    }
-  );
-
+  if (!googleKey) throw new Error("Translation failed and no Google fallback");
+  const res = await fetch(`https://translation.googleapis.com/language/translate/v2?key=${googleKey}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ q: text, source: fromLang, target: toLang, format: "text" }),
+    signal: AbortSignal.timeout(10000),
+  });
   if (!res.ok) throw new Error(`Google Translate ${res.status}`);
-  const data = (await res.json()) as {
-    data?: { translations?: Array<{ translatedText?: string }> };
-  };
+  const data = (await res.json()) as { data?: { translations?: Array<{ translatedText?: string }> } };
   return data.data?.translations?.[0]?.translatedText || text;
 }
 
-// ===============================
-// Layer 2 + 3: Multi-language Pipeline
-// ===============================
-async function humanizePipeline(
-  originalText: string,
-  mode: "standard" | "academic" | "creative",
-  env: Env
-): Promise<string> {
+async function humanizePipeline(originalText: string, mode: "standard" | "academic" | "creative", env: Env): Promise<string> {
   const { processedText, protectedMap } = protectTerms(originalText);
-
   let result = processedText;
-
   try {
     if (mode === "academic") {
-      // EN → CN → JP → FI → EN
-      const cn = await callDeepSeek(
-        result,
-        "Translate to simplified Chinese. PRESERVE all [[REF_n]] and [[TERM_n]] placeholders exactly as-is.",
-        env.DEEPSEEK_API_KEY
-      );
-      const jp = await callDeepSeek(
-        cn,
-        "Translate to Japanese. PRESERVE all placeholders exactly.",
-        env.DEEPSEEK_API_KEY
-      );
+      const cn = await callDeepSeek(result, "Translate to simplified Chinese. PRESERVE all [[REF_n]] and [[TERM_n]] placeholders exactly as-is.", env.DEEPSEEK_API_KEY);
+      const jp = await callDeepSeek(cn, "Translate to Japanese. PRESERVE all placeholders exactly.", env.DEEPSEEK_API_KEY);
       const fi = await callTranslationAPI(jp, "ja", "fi", env.GOOGLE_TRANSLATE_KEY);
-      result = await callDeepSeek(
-        fi,
-        `Task: Translate Finnish text back to professional English.
+      result = await callDeepSeek(fi, `Task: Translate Finnish text back to professional English.
 Reference (original meaning): "${processedText.slice(0, 500)}"
-Style Requirements (CRITICAL):
-- HIGH BURSTINESS: Mix short punchy sentences with complex, flowing ones.
-- HIGH PERPLEXITY: Use diverse, non-robotic vocabulary. Avoid word repetition.
-- FORBIDDEN WORDS: Do NOT use: delve, testament, comprehensive, intricate, showcases, multifaceted, it is worth noting, in conclusion, further research is needed, this essay will explore, it is evident that, the data suggests, the implications are far-reaching, testament to, a nuanced perspective.
-- CRUCIAL: Keep ALL [[REF_n]] and [[TERM_n]] placeholders exactly as-is.
-- Output ONLY the translated English text, nothing else.`,
-        env.DEEPSEEK_API_KEY
-      );
+Style: HIGH BURSTINESS, HIGH PERPLEXITY.
+Avoid: delve, testament, comprehensive, intricate, showcases, multifaceted, it is worth noting, in conclusion, further research is needed.
+CRUCIAL: Keep ALL [[REF_n]] and [[TERM_n]] placeholders exactly as-is.
+Output ONLY the translated English text.`, env.DEEPSEEK_API_KEY);
     } else if (mode === "creative") {
-      // EN → FI → EN (high creativity)
       const fi = await callTranslationAPI(result, "en", "fi", env.GOOGLE_TRANSLATE_KEY);
-      result = await callDeepSeek(
-        fi,
-        `Task: Translate to English with HIGH CREATIVITY.
-- Temperature 1.2: Take creative risks with word choice.
-- High Burstiness: Mix very short sentences with longer ones.
-- Avoid: delve, testament, comprehensive, intricate, showcases.
-- Output ONLY the translated English text.`,
-        env.DEEPSEEK_API_KEY
-      );
+      result = await callDeepSeek(fi, `Task: Translate to English with HIGH CREATIVITY. Avoid: delve, testament, comprehensive, intricate, showcases. Output ONLY the translated English text.`, env.DEEPSEEK_API_KEY);
     } else {
-      // Standard: EN → CN → EN
-      const cn = await callDeepSeek(
-        result,
-        "Translate to Chinese naturally. Keep placeholders as-is.",
-        env.DEEPSEEK_API_KEY
-      );
-      result = await callDeepSeek(
-        cn,
-        "Translate back to English. Make it sound genuinely human-written. Avoid AI clichés.",
-        env.DEEPSEEK_API_KEY
-      );
+      const cn = await callDeepSeek(result, "Translate to Chinese naturally. Keep placeholders as-is.", env.DEEPSEEK_API_KEY);
+      result = await callDeepSeek(cn, "Translate back to English. Make it sound genuinely human-written. Avoid AI clichés.", env.DEEPSEEK_API_KEY);
     }
-
-    // Layer 4: Restore protected terms
     return restoreTerms(result, protectedMap);
   } catch (error) {
-    console.error("Pipeline error:", error);
-    throw new Error(
-      `Humanization failed: ${error instanceof Error ? error.message : String(error)}`
-    );
+    throw new Error(`Humanization failed: ${error instanceof Error ? error.message : String(error)}`);
   }
 }
 
 // ===============================
-// AI Score (HuggingFace)
+// AI Score
 // ===============================
 async function getAIScore(text: string, apiKey: string): Promise<number | null> {
   try {
-    const res = await fetch(
-      "https://api-inference.huggingface.co/models/followsci/bert-ai-text-detector",
-      {
-        method: "POST",
-        headers: {
-          "Authorization": `Bearer ${apiKey}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({ inputs: text }),
-        signal: AbortSignal.timeout(15000),
-      }
-    );
-
+    const res = await fetch("https://api-inference.huggingface.co/models/followsci/bert-ai-text-detector", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ inputs: text }),
+      signal: AbortSignal.timeout(15000),
+    });
     if (!res.ok) return null;
-
     const data = (await res.json()) as Array<Array<{ label: string; score: number }>>;
-    // Response shape: [[{label: "LABEL_1" (AI), score: 0.87}, {label: "LABEL_0" (human), score: 0.13}]]
     if (Array.isArray(data) && data[0] && Array.isArray(data[0])) {
       const aiEntry = data[0].find((e) => e.label === "LABEL_1" || /ai/i.test(e.label));
       return aiEntry ? aiEntry.score : null;
     }
     return null;
-  } catch (e) {
-    console.error("AI Score error:", e);
+  } catch {
     return null;
   }
 }
 
 // ===============================
-// Rate limiter (IP-based, in-memory, best-effort)
+// Rate limiter
 // ===============================
 const rateLimitMap = new Map<string, { count: number; resetAt: number }>();
 const FREE_DAILY_LIMIT = 3;
@@ -303,25 +232,23 @@ const FREE_DAILY_LIMIT = 3;
 function checkRateLimit(ip: string): { allowed: boolean; remaining: number; resetAt: number } {
   const now = Date.now();
   const dayMs = 24 * 60 * 60 * 1000;
-
   const record = rateLimitMap.get(ip);
   if (!record || record.resetAt < now) {
     const resetAt = now + dayMs;
     rateLimitMap.set(ip, { count: 1, resetAt });
     return { allowed: true, remaining: FREE_DAILY_LIMIT - 1, resetAt };
   }
-
   if (record.count >= FREE_DAILY_LIMIT) {
     return { allowed: false, remaining: 0, resetAt: record.resetAt };
   }
-
   record.count++;
-  return {
-    allowed: true,
-    remaining: FREE_DAILY_LIMIT - record.count,
-    resetAt: record.resetAt,
-  };
+  return { allowed: true, remaining: FREE_DAILY_LIMIT - record.count, resetAt: record.resetAt };
 }
+
+// ===============================
+// Webhook event storage (in-memory; for production use KV/D1)
+// ===============================
+const subscriptionStore = new Map<string, { plan: string; status: string; createdAt: number }>();
 
 // ===============================
 // Worker entry
@@ -331,21 +258,18 @@ export default {
     const origin = request.headers.get("Origin") || "";
     const url = new URL(request.url);
 
-    // CORS preflight
     if (request.method === "OPTIONS") {
-      return new Response(null, {
-        status: 204,
-        headers: corsHeaders(origin, env.ALLOWED_ORIGIN),
-      });
+      return new Response(null, { status: 204, headers: corsHeaders(origin, env.ALLOWED_ORIGIN) });
     }
 
-    // Health check
     if (url.pathname === "/health") {
-      return jsonResponse({ status: "ok", env: env.ENVIRONMENT }, 200, origin, env);
+      return jsonResponse({
+        status: "ok",
+        env: env.ENVIRONMENT,
+        paypal: env.PAYPAL_ENV || "sandbox",
+      }, 200, origin, env);
     }
 
-    // Origin check (for non-preflight requests)
-    // 允许 ALLOWED_ORIGIN 和本地开发
     const allowedOrigins = [env.ALLOWED_ORIGIN, "http://localhost:3000", "http://127.0.0.1:3000"];
     if (origin && !allowedOrigins.includes(origin)) {
       return jsonResponse({ error: "Forbidden origin" }, 403, origin, env);
@@ -357,64 +281,98 @@ export default {
       const rl = checkRateLimit(ip);
       if (!rl.allowed) {
         return jsonResponse(
-          {
-            error: "Daily free limit reached. Upgrade to Pro for unlimited rewrites.",
-            limit: FREE_DAILY_LIMIT,
-            resetAt: new Date(rl.resetAt).toISOString(),
-          },
+          { error: "Daily free limit reached. Upgrade to Pro for unlimited rewrites.", limit: FREE_DAILY_LIMIT, resetAt: new Date(rl.resetAt).toISOString() },
           429,
           origin,
           env
         );
       }
-
       try {
         const body = (await request.json()) as { text?: string; mode?: string };
         const text = body.text?.trim();
         const mode = (body.mode || "standard") as "standard" | "academic" | "creative";
-
-        if (!text) {
-          return jsonResponse({ error: "Text is required" }, 400, origin, env);
-        }
-
+        if (!text) return jsonResponse({ error: "Text is required" }, 400, origin, env);
         const wordCount = text.split(/\s+/).length;
-        if (wordCount > 500) {
-          return jsonResponse(
-            { error: "Free tier supports up to 500 words. Upgrade to Pro." },
-            400,
-            origin,
-            env
-          );
-        }
-
-        if (!["standard", "academic", "creative"].includes(mode)) {
-          return jsonResponse({ error: `Invalid mode: ${mode}` }, 400, origin, env);
-        }
-
-        // 缺 key 时给清晰的错误（而不是沉默地失败）
+        if (wordCount > 500) return jsonResponse({ error: "Free tier supports up to 500 words. Upgrade to Pro." }, 400, origin, env);
+        if (!["standard", "academic", "creative"].includes(mode)) return jsonResponse({ error: `Invalid mode: ${mode}` }, 400, origin, env);
         if (!env.DEEPSEEK_API_KEY) {
-          return jsonResponse(
-            {
-              error: "Service temporarily unavailable: DeepSeek API key not configured.",
-              hint: "Set DEEPSEEK_API_KEY via `wrangler secret put DEEPSEEK_API_KEY`",
-            },
-            503,
-            origin,
-            env
-          );
+          return jsonResponse({ error: "Service temporarily unavailable: DeepSeek API key not configured.", hint: "Set DEEPSEEK_API_KEY via `wrangler secret put DEEPSEEK_API_KEY`" }, 503, origin, env);
+        }
+        const humanized = await humanizePipeline(text, mode, env);
+        const score = env.HUGGINGFACE_API_KEY ? await getAIScore(humanized, env.HUGGINGFACE_API_KEY) : null;
+        return jsonResponse({ result: humanized, aiScore: score !== null ? `${(score * 100).toFixed(1)}%` : "N/A", originalWordCount: wordCount, remaining: rl.remaining }, 200, origin, env);
+      } catch (error) {
+        return jsonResponse({ error: error instanceof Error ? error.message : "Internal error" }, 500, origin, env);
+      }
+    }
+
+    // ===== POST /score =====
+    if (url.pathname === "/score" && request.method === "POST") {
+      try {
+        const body = (await request.json()) as { text?: string };
+        const text = body.text?.trim();
+        if (!text) return jsonResponse({ error: "Text is required" }, 400, origin, env);
+        if (!env.HUGGINGFACE_API_KEY) return jsonResponse({ score: null, note: "HUGGINGFACE_API_KEY not set" }, 200, origin, env);
+        const score = await getAIScore(text, env.HUGGINGFACE_API_KEY);
+        return jsonResponse({ score: score !== null ? Math.round(score * 100) : null }, 200, origin, env);
+      } catch (error) {
+        return jsonResponse({ error: error instanceof Error ? error.message : "Internal error" }, 500, origin, env);
+      }
+    }
+
+    // ===== POST /subscribe =====
+    if (url.pathname === "/subscribe" && request.method === "POST") {
+      try {
+        if (!env.PAYPAL_CLIENT_ID || !env.PAYPAL_CLIENT_SECRET) {
+          return jsonResponse({ error: "PayPal not configured" }, 503, origin, env);
         }
 
-        const humanized = await humanizePipeline(text, mode, env);
-        const score = env.HUGGINGFACE_API_KEY
-          ? await getAIScore(humanized, env.HUGGINGFACE_API_KEY)
-          : null;
+        const body = (await request.json()) as { plan?: string };
+        const planKey = body.plan;
+        const planId = planKey === "academic" ? env.PAYPAL_PLAN_ACADEMIC : env.PAYPAL_PLAN_PRO;
+        if (!planId) return jsonResponse({ error: "Invalid plan. Use 'pro' or 'academic'." }, 400, origin, env);
+
+        const token = await getPayPalToken(env);
+
+        const subRes = await fetch(`${PAYPAL_API(env)}/v1/billing/subscriptions`, {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${token}`,
+            "Content-Type": "application/json",
+            Prefer: "return=representation",
+          },
+          body: JSON.stringify({
+            plan_id: planId,
+            application_context: {
+              brand_name: "BypassAI.online",
+              shipping_preference: "NO_SHIPPING",
+              user_action: "SUBSCRIBE_NOW",
+              payment_method: { payer_selected: "PAYPAL", payee_preferred: "IMMEDIATE_PAYMENT_REQUIRED" },
+              return_url: `${env.ALLOWED_ORIGIN}/billing/success`,
+              cancel_url: `${env.ALLOWED_ORIGIN}/billing/cancel`,
+            },
+          }),
+        });
+
+        if (!subRes.ok) {
+          const errBody = await subRes.text().catch(() => "");
+          throw new Error(`PayPal subscribe failed: ${subRes.status} ${errBody.slice(0, 300)}`);
+        }
+
+        const subscription = (await subRes.json()) as {
+          id: string;
+          status: string;
+          links: Array<{ href: string; rel: string }>;
+        };
+
+        const approvalUrl = subscription.links.find((l) => l.rel === "approve")?.href;
+        if (!approvalUrl) throw new Error("No approval URL returned");
 
         return jsonResponse(
           {
-            result: humanized,
-            aiScore: score !== null ? `${(score * 100).toFixed(1)}%` : "N/A",
-            originalWordCount: wordCount,
-            remaining: rl.remaining,
+            subscriptionId: subscription.id,
+            status: subscription.status,
+            approvalUrl,
           },
           200,
           origin,
@@ -430,36 +388,73 @@ export default {
       }
     }
 
-    // ===== POST /score (lightweight score-only) =====
-    if (url.pathname === "/score" && request.method === "POST") {
+    // ===== GET /subscription/:id =====
+    if (url.pathname.startsWith("/subscription/") && request.method === "GET") {
       try {
-        const body = (await request.json()) as { text?: string };
-        const text = body.text?.trim();
-        if (!text) return jsonResponse({ error: "Text is required" }, 400, origin, env);
-        if (!env.HUGGINGFACE_API_KEY) {
-          return jsonResponse({ score: null, note: "HUGGINGFACE_API_KEY not set" }, 200, origin, env);
-        }
-        const score = await getAIScore(text, env.HUGGINGFACE_API_KEY);
-        return jsonResponse(
-          { score: score !== null ? Math.round(score * 100) : null },
-          200,
-          origin,
-          env
-        );
+        if (!env.PAYPAL_CLIENT_ID) return jsonResponse({ error: "PayPal not configured" }, 503, origin, env);
+        const subId = url.pathname.split("/")[2];
+        const token = await getPayPalToken(env);
+        const res = await fetch(`${PAYPAL_API(env)}/v1/billing/subscriptions/${subId}`, {
+          headers: { Authorization: `Bearer ${token}` },
+        });
+        if (!res.ok) return jsonResponse({ error: `PayPal ${res.status}` }, res.status as 400, origin, env);
+        const data = await res.json();
+        return jsonResponse(data, 200, origin, env);
       } catch (error) {
-        return jsonResponse(
-          { error: error instanceof Error ? error.message : "Internal error" },
-          500,
-          origin,
-          env
-        );
+        return jsonResponse({ error: error instanceof Error ? error.message : "Internal error" }, 500, origin, env);
+      }
+    }
+
+    // ===== POST /webhooks/paypal =====
+    if (url.pathname === "/webhooks/paypal" && request.method === "POST") {
+      try {
+        const event = (await request.json()) as {
+          event_type: string;
+          resource: { id: string; plan_id?: string; status?: string };
+        };
+
+        console.log(`PayPal webhook: ${event.event_type} ${event.resource.id}`);
+
+        switch (event.event_type) {
+          case "BILLING.SUBSCRIPTION.CREATED":
+          case "BILLING.SUBSCRIPTION.ACTIVATED":
+          case "BILLING.SUBSCRIPTION.UPDATED":
+            subscriptionStore.set(event.resource.id, {
+              plan: event.resource.plan_id || "unknown",
+              status: event.resource.status || "unknown",
+              createdAt: Date.now(),
+            });
+            break;
+          case "BILLING.SUBSCRIPTION.CANCELLED":
+          case "BILLING.SUBSCRIPTION.SUSPENDED":
+          case "BILLING.SUBSCRIPTION.EXPIRED":
+            const existing = subscriptionStore.get(event.resource.id);
+            if (existing) {
+              existing.status = event.resource.status || "cancelled";
+            }
+            break;
+          case "PAYMENT.SALE.COMPLETED":
+            console.log(`Payment received for subscription ${event.resource.id}`);
+            break;
+        }
+
+        return jsonResponse({ received: true }, 200, origin, env);
+      } catch (error) {
+        return jsonResponse({ error: error instanceof Error ? error.message : "Internal error" }, 500, origin, env);
       }
     }
 
     return jsonResponse(
       {
         service: "bypass-ai-api",
-        routes: ["POST /humanize", "POST /score", "GET /health"],
+        routes: [
+          "POST /humanize",
+          "POST /score",
+          "POST /subscribe",
+          "GET /subscription/:id",
+          "POST /webhooks/paypal",
+          "GET /health",
+        ],
       },
       200,
       origin,
