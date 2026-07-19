@@ -1,11 +1,18 @@
 /**
- * BypassAI.online — Core API + PayPal Subscriptions
+ * BypassAI.online — Core API + PayPal Subscriptions (Production-Ready)
+ *
+ * Webhook reliability:
+ * - Signature verification via PayPal's verify-webhook-signature API
+ * - Persistent state in Cloudflare KV (survives worker restart)
+ * - Returns 5xx on transient errors to trigger PayPal retry
  *
  * Routes:
  *   POST /humanize       — full Guardrail + multi-language rewrite pipeline
  *   POST /score          — AI probability score (HuggingFace)
  *   POST /subscribe      — create PayPal subscription, return approval URL
- *   POST /webhooks/paypal — handle PayPal subscription events
+ *   GET  /subscription/:id — query PayPal for current status
+ *   POST /webhooks/paypal — verified PayPal webhook receiver (writes to KV)
+ *   GET  /subscription/store/:id — debug: inspect persisted KV state
  *   GET  /health         — liveness check
  */
 
@@ -21,7 +28,10 @@ export interface Env {
   PAYPAL_ENV: "sandbox" | "live";
   PAYPAL_PLAN_PRO: string;
   PAYPAL_PLAN_ACADEMIC: string;
-  PAYPAL_WEBHOOK_ID?: string;
+  PAYPAL_WEBHOOK_ID: string;
+
+  // KV binding
+  SUBSCRIPTIONS: KVNamespace;
 
   ALLOWED_ORIGIN: string;
   ENVIRONMENT: string;
@@ -31,6 +41,17 @@ const PAYPAL_API = (env: Env) =>
   env.PAYPAL_ENV === "live"
     ? "https://api-m.paypal.com"
     : "https://api-m.sandbox.paypal.com";
+
+// ===============================
+// KV key helpers
+// ===============================
+const KV_KEYS = {
+  subscription: (id: string) => `sub:${id}`,
+  eventLog: (id: string) => `event:${id}`,
+};
+
+// TTL: 90 days for subscriptions (in case user comes back)
+const SUBSCRIPTION_TTL_SECONDS = 90 * 24 * 60 * 60;
 
 // ===============================
 // CORS
@@ -57,9 +78,17 @@ function jsonResponse(data: unknown, status: number, origin: string, env: Env): 
 }
 
 // ===============================
-// PayPal: get access token
+// PayPal: get access token (cached)
 // ===============================
+let cachedToken: { token: string; envId: string; expiresAt: number } | null = null;
+
 async function getPayPalToken(env: Env): Promise<string> {
+  // Simple in-memory cache (per Worker instance) — fine because PayPal tokens last ~9h
+  const envId = env.PAYPAL_CLIENT_ID;
+  if (cachedToken && cachedToken.envId === envId && cachedToken.expiresAt > Date.now() + 60_000) {
+    return cachedToken.token;
+  }
+
   const auth = btoa(`${env.PAYPAL_CLIENT_ID}:${env.PAYPAL_CLIENT_SECRET}`);
   const res = await fetch(`${PAYPAL_API(env)}/v1/oauth2/token`, {
     method: "POST",
@@ -73,19 +102,106 @@ async function getPayPalToken(env: Env): Promise<string> {
     const err = await res.text().catch(() => "");
     throw new Error(`PayPal auth failed: ${res.status} ${err.slice(0, 200)}`);
   }
-  const data = (await res.json()) as { access_token: string };
+  const data = (await res.json()) as { access_token: string; expires_in: number };
+  cachedToken = {
+    token: data.access_token,
+    envId,
+    expiresAt: Date.now() + data.expires_in * 1000,
+  };
   return data.access_token;
 }
 
 // ===============================
-// Layer 1: Term Protection
+// PayPal webhook signature verification
 // ===============================
-interface GuardrailState {
-  processedText: string;
-  protectedMap: Map<string, string>;
+interface WebhookHeaders {
+  transmissionId: string;
+  transmissionTime: string;
+  transmissionSig: string;
+  certUrl: string;
+  authAlgo: string;
 }
 
-function protectTerms(text: string): GuardrailState {
+function extractWebhookHeaders(request: Request): WebhookHeaders | null {
+  const transmissionId = request.headers.get("PAYPAL-TRANSMISSION-ID");
+  const transmissionTime = request.headers.get("PAYPAL-TRANSMISSION-TIME");
+  const transmissionSig = request.headers.get("PAYPAL-TRANSMISSION-SIG");
+  const certUrl = request.headers.get("PAYPAL-CERT-URL");
+  const authAlgo = request.headers.get("PAYPAL-AUTH-ALGO");
+  if (!transmissionId || !transmissionTime || !transmissionSig || !certUrl || !authAlgo) {
+    return null;
+  }
+  return { transmissionId, transmissionTime, transmissionSig, certUrl, authAlgo };
+}
+
+async function verifyWebhookSignature(
+  headers: WebhookHeaders,
+  rawBody: string,
+  env: Env
+): Promise<boolean> {
+  try {
+    const token = await getPayPalToken(env);
+    const verifyRes = await fetch(`${PAYPAL_API(env)}/v1/notifications/verify-webhook-signature`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        auth_algo: headers.authAlgo,
+        cert_url: headers.certUrl,
+        transmission_id: headers.transmissionId,
+        transmission_sig: headers.transmissionSig,
+        transmission_time: headers.transmissionTime,
+        webhook_id: env.PAYPAL_WEBHOOK_ID,
+        webhook_event: JSON.parse(rawBody),
+      }),
+    });
+    if (!verifyRes.ok) {
+      console.error(`[Webhook Verify] HTTP ${verifyRes.status}`);
+      return false;
+    }
+    const result = (await verifyRes.json()) as { verification_status?: string };
+    return result.verification_status === "SUCCESS";
+  } catch (e) {
+    console.error("[Webhook Verify] Error:", e);
+    return false;
+  }
+}
+
+// ===============================
+// Subscription persistence (KV)
+// ===============================
+interface SubscriptionRecord {
+  subscriptionId: string;
+  plan: string;
+  status: string;
+  email?: string;
+  createdAt: number;
+  updatedAt: number;
+  lastEventType: string;
+}
+
+async function saveSubscription(env: Env, record: SubscriptionRecord): Promise<void> {
+  await env.SUBSCRIPTIONS.put(KV_KEYS.subscription(record.subscriptionId), JSON.stringify(record), {
+    expirationTtl: SUBSCRIPTION_TTL_SECONDS,
+  });
+}
+
+async function getSubscription(env: Env, id: string): Promise<SubscriptionRecord | null> {
+  const raw = await env.SUBSCRIPTIONS.get(KV_KEYS.subscription(id));
+  if (!raw) return null;
+  try {
+    return JSON.parse(raw) as SubscriptionRecord;
+  } catch {
+    return null;
+  }
+}
+
+// ===============================
+// Layer 1: Term Protection (Guardrail)
+// ===============================
+function protectTerms(text: string): { processedText: string; protectedMap: Map<string, string> } {
   const protectedMap = new Map<string, string>();
   let counter = 0;
   const citationRegex = /(\[\d+[\d\s\-,]*\]|\([A-Z][a-z]+(\s+et\s+al\.)?,\s+\d{4}\))/g;
@@ -96,13 +212,11 @@ function protectTerms(text: string): GuardrailState {
     protectedMap.set(id, match);
     return id;
   });
-
   processed = processed.replace(techTermRegex, (match) => {
     const id = `[[TERM_${counter++}]]`;
     protectedMap.set(id, match);
     return id;
   });
-
   return { processedText: processed, protectedMap };
 }
 
@@ -115,7 +229,7 @@ function restoreTerms(text: string, protectedMap: Map<string, string>): string {
 }
 
 // ===============================
-// DeepSeek
+// DeepSeek + Translation
 // ===============================
 async function callDeepSeek(content: string, systemPrompt: string, apiKey: string): Promise<string> {
   const controller = new AbortController();
@@ -200,9 +314,6 @@ Output ONLY the translated English text.`, env.DEEPSEEK_API_KEY);
   }
 }
 
-// ===============================
-// AI Score
-// ===============================
 async function getAIScore(text: string, apiKey: string): Promise<number | null> {
   try {
     const res = await fetch("https://api-inference.huggingface.co/models/followsci/bert-ai-text-detector", {
@@ -223,9 +334,7 @@ async function getAIScore(text: string, apiKey: string): Promise<number | null> 
   }
 }
 
-// ===============================
-// Rate limiter
-// ===============================
+// Rate limiter (in-memory; for production scale use KV/Durable Objects)
 const rateLimitMap = new Map<string, { count: number; resetAt: number }>();
 const FREE_DAILY_LIMIT = 3;
 
@@ -246,11 +355,6 @@ function checkRateLimit(ip: string): { allowed: boolean; remaining: number; rese
 }
 
 // ===============================
-// Webhook event storage (in-memory; for production use KV/D1)
-// ===============================
-const subscriptionStore = new Map<string, { plan: string; status: string; createdAt: number }>();
-
-// ===============================
 // Worker entry
 // ===============================
 export default {
@@ -263,12 +367,57 @@ export default {
     }
 
     if (url.pathname === "/health") {
-      return jsonResponse({
-        status: "ok",
-        env: env.ENVIRONMENT,
-        paypal: env.PAYPAL_ENV || "sandbox",
-      }, 200, origin, env);
-    }
+          return jsonResponse(
+            {
+              status: "ok",
+              env: env.ENVIRONMENT,
+              paypal: env.PAYPAL_ENV,
+              kv: "SUBSCRIPTIONS",
+              webhookId: env.PAYPAL_WEBHOOK_ID,
+            },
+            200,
+            origin,
+            env
+          );
+        }
+
+        // ===== POST /__test__/webhook (TEST ONLY — bypasses signature verification) =====
+        // Enabled only when ENVIRONMENT !== 'production'. Lets us verify KV persistence
+        // without needing real PayPal-signed webhooks (which require a user to
+        // complete the approve flow in a browser).
+        if (url.pathname === "/__test__/webhook" && request.method === "POST" && env.ENVIRONMENT !== "production") {
+          try {
+            const event = (await request.json()) as {
+              event_type: string;
+              resource: { id: string; plan_id?: string; status?: string; subscriber?: { email_address?: string } };
+            };
+            if (!event.event_type || !event.resource?.id) {
+              return jsonResponse({ error: "Invalid payload" }, 400, origin, env);
+            }
+
+            const subId = event.resource.id;
+            const existing = await getSubscription(env, subId);
+            const planId = event.resource.plan_id || existing?.plan || "unknown";
+            const newStatus = event.resource.status || "unknown";
+            const email = event.resource.subscriber?.email_address || existing?.email;
+
+            const record: SubscriptionRecord = {
+              subscriptionId: subId,
+              plan: planId,
+              status: newStatus,
+              email,
+              createdAt: existing?.createdAt || Date.now(),
+              updatedAt: Date.now(),
+              lastEventType: event.event_type,
+            };
+            await saveSubscription(env, record);
+
+            console.log(`[Test Webhook] ${event.event_type} → ${subId} (${newStatus}) — saved to KV`);
+            return jsonResponse({ received: true, subscriptionId: subId, status: newStatus, testMode: true }, 200, origin, env);
+          } catch (error) {
+            return jsonResponse({ error: error instanceof Error ? error.message : "Internal error" }, 500, origin, env);
+          }
+        }
 
     const allowedOrigins = [env.ALLOWED_ORIGIN, "http://localhost:3000", "http://127.0.0.1:3000"];
     if (origin && !allowedOrigins.includes(origin)) {
@@ -326,14 +475,12 @@ export default {
         if (!env.PAYPAL_CLIENT_ID || !env.PAYPAL_CLIENT_SECRET) {
           return jsonResponse({ error: "PayPal not configured" }, 503, origin, env);
         }
-
         const body = (await request.json()) as { plan?: string };
         const planKey = body.plan;
         const planId = planKey === "academic" ? env.PAYPAL_PLAN_ACADEMIC : env.PAYPAL_PLAN_PRO;
         if (!planId) return jsonResponse({ error: "Invalid plan. Use 'pro' or 'academic'." }, 400, origin, env);
 
         const token = await getPayPalToken(env);
-
         const subRes = await fetch(`${PAYPAL_API(env)}/v1/billing/subscriptions`, {
           method: "POST",
           headers: {
@@ -353,48 +500,25 @@ export default {
             },
           }),
         });
-
         if (!subRes.ok) {
           const errBody = await subRes.text().catch(() => "");
           throw new Error(`PayPal subscribe failed: ${subRes.status} ${errBody.slice(0, 300)}`);
         }
-
-        const subscription = (await subRes.json()) as {
-          id: string;
-          status: string;
-          links: Array<{ href: string; rel: string }>;
-        };
-
+        const subscription = (await subRes.json()) as { id: string; status: string; links: Array<{ href: string; rel: string }> };
         const approvalUrl = subscription.links.find((l) => l.rel === "approve")?.href;
         if (!approvalUrl) throw new Error("No approval URL returned");
-
-        return jsonResponse(
-          {
-            subscriptionId: subscription.id,
-            status: subscription.status,
-            approvalUrl,
-          },
-          200,
-          origin,
-          env
-        );
+        return jsonResponse({ subscriptionId: subscription.id, status: subscription.status, approvalUrl }, 200, origin, env);
       } catch (error) {
-        return jsonResponse(
-          { error: error instanceof Error ? error.message : "Internal error" },
-          500,
-          origin,
-          env
-        );
+        return jsonResponse({ error: error instanceof Error ? error.message : "Internal error" }, 500, origin, env);
       }
     }
 
-    // ===== GET /subscription/store/:id (debug — internal storage) =====
-    // 注意: Worker 实例重启会清空 in-memory store,生产应该用 KV/D1
+    // ===== GET /subscription/store/:id (debug — KV state) =====
     if (url.pathname.startsWith("/subscription/store/") && request.method === "GET") {
       const subId = url.pathname.split("/")[3];
-      const stored = subscriptionStore.get(subId);
+      const stored = await getSubscription(env, subId);
       return jsonResponse(
-        stored ? { subscriptionId: subId, ...stored } : { subscriptionId: subId, status: "not_found" },
+        stored || { subscriptionId: subId, status: "not_found" },
         200,
         origin,
         env
@@ -418,65 +542,91 @@ export default {
       }
     }
 
-    // ===== POST /webhooks/paypal =====
+    // ===== POST /webhooks/paypal (verified, persisted) =====
     if (url.pathname === "/webhooks/paypal" && request.method === "POST") {
+      // 1. Read raw body (needed for signature verification)
+      const rawBody = await request.text();
+
+      // 2. Extract + verify signature
+      const sigHeaders = extractWebhookHeaders(request);
+      if (!sigHeaders) {
+        console.warn("[Webhook] Missing required PayPal signature headers");
+        return jsonResponse({ error: "Missing signature headers" }, 400, origin, env);
+      }
+
+      const isValid = await verifyWebhookSignature(sigHeaders, rawBody, env);
+      if (!isValid) {
+        console.warn(`[Webhook] SIGNATURE VERIFICATION FAILED (transmission: ${sigHeaders.transmissionId})`);
+        return jsonResponse({ error: "Invalid signature" }, 401, origin, env);
+      }
+      console.log(`[Webhook] Signature verified (${sigHeaders.transmissionId})`);
+
+      // 3. Parse + process event
+      let event: {
+        id?: string;
+        event_type: string;
+        resource: {
+          id: string;
+          plan_id?: string;
+          status?: string;
+          subscriber?: { email_address?: string };
+        };
+      };
       try {
-        const event = (await request.json()) as {
-          id?: string;
-          event_type: string;
-          resource: { id: string; plan_id?: string; status?: string };
+        event = JSON.parse(rawBody);
+      } catch {
+        return jsonResponse({ error: "Invalid JSON" }, 400, origin, env);
+      }
+
+      if (!event.event_type || !event.resource?.id) {
+        return jsonResponse({ error: "Invalid event payload" }, 400, origin, env);
+      }
+
+      try {
+        const subId = event.resource.id;
+        const existing = await getSubscription(env, subId);
+
+        // Idempotency: if we've already processed this exact event, skip
+        if (event.id) {
+          const alreadyProcessed = await env.SUBSCRIPTIONS.get(KV_KEYS.eventLog(event.id));
+          if (alreadyProcessed) {
+            console.log(`[Webhook] Duplicate event ${event.id} skipped`);
+            return jsonResponse({ received: true, duplicate: true }, 200, origin, env);
+          }
+        }
+
+        const planId = event.resource.plan_id || existing?.plan || "unknown";
+        const newStatus = event.resource.status || "unknown";
+        const email = event.resource.subscriber?.email_address || existing?.email;
+
+        const record: SubscriptionRecord = {
+          subscriptionId: subId,
+          plan: planId,
+          status: newStatus,
+          email,
+          createdAt: existing?.createdAt || Date.now(),
+          updatedAt: Date.now(),
+          lastEventType: event.event_type,
         };
 
-        // 基础验证：拒绝明显伪造的请求
-        // 生产环境应该用 PAYPAL-TRANSMISSION-SIG + cert_url 验证签名
-        // 这里只做存在性 + 格式检查，避免无效请求污染存储
-        if (!event.event_type || !event.resource?.id) {
-          return jsonResponse({ error: "Invalid event payload" }, 400, origin, env);
+        await saveSubscription(env, record);
+
+        // Log this event ID for idempotency (TTL 7 days is enough for PayPal retry window)
+        if (event.id) {
+          await env.SUBSCRIPTIONS.put(KV_KEYS.eventLog(event.id), "1", {
+            expirationTtl: 7 * 24 * 60 * 60,
+          });
         }
 
-        console.log(`[PayPal Webhook] ${event.event_type} → ${event.resource.id} (event: ${event.id || "n/a"})`);
+        console.log(`[Webhook] ${event.event_type} → ${subId} (${newStatus})`);
 
-        switch (event.event_type) {
-          case "BILLING.SUBSCRIPTION.CREATED":
-          case "BILLING.SUBSCRIPTION.ACTIVATED":
-          case "BILLING.SUBSCRIPTION.UPDATED":
-            subscriptionStore.set(event.resource.id, {
-              plan: event.resource.plan_id || "unknown",
-              status: event.resource.status || "unknown",
-              createdAt: Date.now(),
-            });
-            console.log(`[PayPal] Subscription ${event.resource.id} → ${event.resource.status}`);
-            break;
-          case "BILLING.SUBSCRIPTION.CANCELLED":
-          case "BILLING.SUBSCRIPTION.SUSPENDED":
-          case "BILLING.SUBSCRIPTION.EXPIRED":
-            const existing = subscriptionStore.get(event.resource.id);
-            if (existing) {
-              existing.status = event.resource.status || "cancelled";
-              console.log(`[PayPal] Subscription ${event.resource.id} → ${event.resource.status}`);
-            } else {
-              subscriptionStore.set(event.resource.id, {
-                plan: event.resource.plan_id || "unknown",
-                status: event.resource.status || "cancelled",
-                createdAt: Date.now(),
-              });
-            }
-            break;
-          case "PAYMENT.SALE.COMPLETED":
-          case "PAYMENT.CAPTURE.COMPLETED":
-            console.log(`[PayPal] Payment received for ${event.resource.id}`);
-            break;
-          case "PAYMENT.SALE.REVERSED":
-          case "PAYMENT.CAPTURE.DENIED":
-          case "BILLING.SUBSCRIPTION.PAYMENT.FAILED":
-            console.log(`[PayPal] Payment issue for ${event.resource.id}: ${event.event_type}`);
-            break;
-        }
+        // Future: dispatch to email service / user notification queue here
 
-        return jsonResponse({ received: true, eventType: event.event_type }, 200, origin, env);
+        return jsonResponse({ received: true, subscriptionId: subId, status: newStatus }, 200, origin, env);
       } catch (error) {
-        console.error("[PayPal Webhook] Error:", error);
-        return jsonResponse({ error: error instanceof Error ? error.message : "Internal error" }, 500, origin, env);
+        // Return 500 so PayPal retries the webhook
+        console.error("[Webhook] Processing error:", error);
+        return jsonResponse({ error: error instanceof Error ? error.message : "Processing failed" }, 500, origin, env);
       }
     }
 
@@ -488,6 +638,7 @@ export default {
           "POST /score",
           "POST /subscribe",
           "GET /subscription/:id",
+          "GET /subscription/store/:id",
           "POST /webhooks/paypal",
           "GET /health",
         ],

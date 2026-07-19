@@ -3,23 +3,16 @@ main = "src/index.ts"
 compatibility_date = "2026-07-19"
 compatibility_flags = ["nodejs_compat"]
 
-# CORS allowed origin (set per env)
+# 当前是 dev 模式（允许 __test__/webhook），生产前改成 "production"
 [vars]
 ALLOWED_ORIGIN = "https://bypass-ai.pages.dev"
 ENVIRONMENT = "production"
 PAYPAL_ENV = "sandbox"
 
-# PayPal Subscription Plan IDs (created in PayPal dashboard / API)
 PAYPAL_PLAN_PRO = "P-9H8685126A247253XNJOLYFI"
 PAYPAL_PLAN_ACADEMIC = "P-16D99338NM5834927NJOLYFI"
-
-# PayPal Webhook ID (created via /v1/notifications/webhooks)
 PAYPAL_WEBHOOK_ID = "1K741337DT3618449"
 
-# Secrets (set via `wrangler secret put`):
-#   PAYPAL_CLIENT_ID
-#   PAYPAL_CLIENT_SECRET
-#   PAYPAL_WEBHOOK_ID_OVERRIDE (optional, for signature verification in production)
-#   DEEPSEEK_API_KEY
-#   HUGGINGFACE_API_KEY
-#   GOOGLE_TRANSLATE_KEY
+[[kv_namespaces]]
+binding = "SUBSCRIPTIONS"
+id = "22bdc1f52b8c4870b08bfd8541f3d3e8"
