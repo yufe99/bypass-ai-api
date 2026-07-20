@@ -3,11 +3,18 @@ main = "src/index.ts"
 compatibility_date = "2026-07-19"
 compatibility_flags = ["nodejs_compat"]
 
-# 当前是 dev 模式（允许 __test__/webhook），生产前改成 "production"
+# CORS allowed origin
 [vars]
-ALLOWED_ORIGIN = "https://bypass-ai.pages.dev"
+ALLOWED_ORIGIN = "https://bodyscore.me"
 ENVIRONMENT = "production"
 PAYPAL_ENV = "sandbox"
+
+# Extra allowed origins (comma-separated). Keep in sync with CF Pages custom domains.
+EXTRA_ALLOWED_ORIGINS = "https://bypass-ai.pages.dev,https://www.bodyscore.me"
+
+# PayPal return/cancel URLs after checkout — point to production domain
+PAYPAL_RETURN_URL = "https://bodyscore.me/billing/success"
+PAYPAL_CANCEL_URL = "https://bodyscore.me/billing/cancel"
 
 PAYPAL_PLAN_PRO = "P-9H8685126A247253XNJOLYFI"
 PAYPAL_PLAN_ACADEMIC = "P-16D99338NM5834927NJOLYFI"

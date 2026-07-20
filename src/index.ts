@@ -29,6 +29,11 @@ export interface Env {
   PAYPAL_PLAN_PRO: string;
   PAYPAL_PLAN_ACADEMIC: string;
   PAYPAL_WEBHOOK_ID: string;
+  // Optional: override return/cancel URLs after PayPal checkout (default = ALLOWED_ORIGIN)
+  PAYPAL_RETURN_URL?: string;
+  PAYPAL_CANCEL_URL?: string;
+  // Optional: extra allowed origins (comma-separated), e.g. "https://bodyscore.me,https://www.bodyscore.me"
+  EXTRA_ALLOWED_ORIGINS?: string;
 
   // KV binding
   SUBSCRIPTIONS: KVNamespace;
@@ -433,7 +438,12 @@ export default {
           }
         }
 
-    const allowedOrigins = [env.ALLOWED_ORIGIN, "http://localhost:3000", "http://127.0.0.1:3000"];
+    const allowedOrigins = [
+      env.ALLOWED_ORIGIN,
+      "http://localhost:3000",
+      "http://127.0.0.1:3000",
+      ...(env.EXTRA_ALLOWED_ORIGINS ? env.EXTRA_ALLOWED_ORIGINS.split(",").map((o) => o.trim()).filter(Boolean) : []),
+    ];
     if (origin && !allowedOrigins.includes(origin)) {
       return jsonResponse({ error: "Forbidden origin" }, 403, origin, env);
     }
@@ -509,8 +519,8 @@ export default {
               shipping_preference: "NO_SHIPPING",
               user_action: "SUBSCRIBE_NOW",
               payment_method: { payer_selected: "PAYPAL", payee_preferred: "IMMEDIATE_PAYMENT_REQUIRED" },
-              return_url: `${env.ALLOWED_ORIGIN}/billing/success`,
-              cancel_url: `${env.ALLOWED_ORIGIN}/billing/cancel`,
+              return_url: env.PAYPAL_RETURN_URL || `${env.ALLOWED_ORIGIN}/billing/success`,
+              cancel_url: env.PAYPAL_CANCEL_URL || `${env.ALLOWED_ORIGIN}/billing/cancel`,
             },
           }),
         });
