@@ -32,6 +32,18 @@ export interface Env {
   // Optional: override return/cancel URLs after PayPal checkout (default = ALLOWED_ORIGIN)
   PAYPAL_RETURN_URL?: string;
   PAYPAL_CANCEL_URL?: string;
+
+  // Creem
+  CREEM_API_KEY: string;
+  CREEM_ENV: "test" | "live";
+  CREEM_PRODUCT_PRO: string;
+  CREEM_PRODUCT_ACADEMIC: string;
+  // Optional: override return URLs after Creem checkout
+  CREEM_SUCCESS_URL?: string;
+  CREEM_CANCEL_URL?: string;
+  // Optional: webhook signing secret (for verifying Creem webhook signatures)
+  CREEM_WEBHOOK_SECRET?: string;
+
   // Optional: extra allowed origins (comma-separated), e.g. "https://bodyscore.me,https://www.bodyscore.me"
   EXTRA_ALLOWED_ORIGINS?: string;
 
@@ -537,6 +549,66 @@ export default {
       }
     }
 
+    // ===== POST /subscribe/creem (Creem checkout) =====
+    if (url.pathname === "/subscribe/creem" && request.method === "POST") {
+      try {
+        if (!env.CREEM_API_KEY) {
+          return jsonResponse({ error: "Creem not configured" }, 503, origin, env);
+        }
+
+        const body = (await request.json()) as { plan?: string };
+        const planKey = body.plan;
+        const productId = planKey === "academic" ? env.CREEM_PRODUCT_ACADEMIC : env.CREEM_PRODUCT_PRO;
+        if (!productId) return jsonResponse({ error: "Invalid plan. Use 'pro' or 'academic'." }, 400, origin, env);
+
+        const creemBase = env.CREEM_ENV === "live" ? "https://api.creem.io" : "https://test-api.creem.io";
+        const checkoutRes = await fetch(`${creemBase}/v1/checkouts`, {
+          method: "POST",
+          headers: {
+            "x-api-key": env.CREEM_API_KEY,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            product_id: productId,
+            success_url: env.CREEM_SUCCESS_URL || `${env.ALLOWED_ORIGIN}/billing/success`,
+            // Note: Creem does not support cancel_url in checkout creation — handle cancellation
+            // via Creem's customer portal instead
+          }),
+        });
+
+        if (!checkoutRes.ok) {
+          const errBody = await checkoutRes.text().catch(() => "");
+          throw new Error(`Creem checkout failed: ${checkoutRes.status} ${errBody.slice(0, 300)}`);
+        }
+
+        const checkout = (await checkoutRes.json()) as {
+          id: string;
+          status: string;
+          checkout_url: string;
+          product: string;
+        };
+
+        return jsonResponse(
+          {
+            checkoutId: checkout.id,
+            status: checkout.status,
+            checkoutUrl: checkout.checkout_url,
+            productId: checkout.product,
+          },
+          200,
+          origin,
+          env
+        );
+      } catch (error) {
+        return jsonResponse(
+          { error: error instanceof Error ? error.message : "Internal error" },
+          500,
+          origin,
+          env
+        );
+      }
+    }
+
     // ===== GET /subscription/store/:id (debug — KV state) =====
     if (url.pathname.startsWith("/subscription/store/") && request.method === "GET") {
       const subId = url.pathname.split("/")[3];
@@ -654,6 +726,69 @@ export default {
       }
     }
 
+    // ===== POST /webhooks/creem =====
+    if (url.pathname === "/webhooks/creem" && request.method === "POST") {
+      try {
+        const rawBody = await request.text();
+        const sig = request.headers.get("creem-signature");
+
+        // Verify signature (HMAC-SHA256 over raw body)
+        if (env.CREEM_WEBHOOK_SECRET && sig) {
+          const encoder = new TextEncoder();
+          const key = await crypto.subtle.importKey(
+            "raw",
+            encoder.encode(env.CREEM_WEBHOOK_SECRET),
+            { name: "HMAC", hash: "SHA-256" },
+            false,
+            ["sign"]
+          );
+          const mac = await crypto.subtle.sign("HMAC", key, encoder.encode(rawBody));
+          const expectedHex = Array.from(new Uint8Array(mac))
+            .map((b) => b.toString(16).padStart(2, "0"))
+            .join("");
+          if (expectedHex !== sig) {
+            console.warn("[Creem Webhook] Signature mismatch");
+            return jsonResponse({ error: "Invalid signature" }, 401, origin, env);
+          }
+        }
+
+        const event = JSON.parse(rawBody) as {
+          eventType?: string;
+          type?: string;
+          object?: {
+            id?: string;
+            customer?: { email?: string };
+            product?: { id?: string; name?: string };
+            status?: string;
+            metadata?: Record<string, string>;
+          };
+        };
+        const eventType = event.eventType ?? event.type ?? "unknown";
+        const obj = event.object ?? {};
+
+        // Persist to KV
+        if (obj.id && obj.product?.id) {
+          const record = {
+            subscriptionId: obj.id,
+            plan: obj.product.name ?? obj.product.id,
+            status: obj.status ?? "unknown",
+            email: obj.customer?.email,
+            createdAt: Date.now(),
+            updatedAt: Date.now(),
+            lastEventType: eventType,
+            provider: "creem",
+          };
+          await saveSubscription(env, record);
+          console.log(`[Creem Webhook] ${eventType} → ${obj.id} (${obj.status})`);
+        }
+
+        return jsonResponse({ received: true, provider: "creem", eventType }, 200, origin, env);
+      } catch (error) {
+        console.error("[Creem Webhook] Error:", error);
+        return jsonResponse({ error: error instanceof Error ? error.message : "Processing failed" }, 500, origin, env);
+      }
+    }
+
     return jsonResponse(
       {
         service: "bypass-ai-api",
@@ -661,9 +796,11 @@ export default {
           "POST /humanize",
           "POST /score",
           "POST /subscribe",
+          "POST /subscribe/creem",
           "GET /subscription/:id",
           "GET /subscription/store/:id",
           "POST /webhooks/paypal",
+          "POST /webhooks/creem",
           "GET /health",
         ],
       },

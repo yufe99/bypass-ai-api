@@ -20,6 +20,13 @@ PAYPAL_PLAN_PRO = "P-9H8685126A247253XNJOLYFI"
 PAYPAL_PLAN_ACADEMIC = "P-16D99338NM5834927NJOLYFI"
 PAYPAL_WEBHOOK_ID = "1K741337DT3618449"
 
+# Creem (test mode — switch to 'live' for production)
+CREEM_ENV = "test"
+CREEM_PRODUCT_PRO = "prod_70Q9aC8kQyeaKcELO3hCW5"
+CREEM_PRODUCT_ACADEMIC = "prod_7HtdVp5oWfwokZPPWqvyVz"
+CREEM_SUCCESS_URL = "https://bodyscore.me/billing/success"
+CREEM_CANCEL_URL = "https://bodyscore.me/billing/cancel"
+
 [[kv_namespaces]]
 binding = "SUBSCRIPTIONS"
 id = "22bdc1f52b8c4870b08bfd8541f3d3e8"
