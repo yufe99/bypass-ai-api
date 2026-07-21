@@ -306,32 +306,53 @@ async function callTranslationAPI(text: string, fromLang: string, toLang: string
 
 async function humanizePipeline(originalText: string, mode: "standard" | "academic" | "creative", env: Env): Promise<string> {
   const { processedText, protectedMap } = protectTerms(originalText);
-  let result = processedText;
   try {
     if (mode === "academic") {
-      // Academic: EN → CN → JP → FI → EN (4 hops via DeepSeek for consistency)
-      const cn = await callDeepSeek(result, "Translate to simplified Chinese. PRESERVE all [[REF_n]] and [[TERM_n]] placeholders exactly as-is.", env.DEEPSEEK_API_KEY);
-      const jp = await callDeepSeek(cn, "Translate to Japanese. PRESERVE all placeholders exactly.", env.DEEPSEEK_API_KEY);
-      // Use DeepSeek for FI translation too (avoids NIU Trans 404 / Google Translate API key requirement)
-      const fi = await callDeepSeek(jp, "Translate to Finnish (suomi). PRESERVE all [[REF_n]] and [[TERM_n]] placeholders exactly.", env.DEEPSEEK_API_KEY);
-      result = await callDeepSeek(fi, `Task: Translate Finnish text back to professional English.
-Reference (original meaning): "${processedText.slice(0, 500)}"
-Style: HIGH BURSTINESS (mix short punchy sentences with longer flowing ones), HIGH PERPLEXITY (varied vocabulary, avoid repetition).
-Avoid these AI clichés: delve, testament, comprehensive, intricate, showcases, multifaceted, it is worth noting, in conclusion, further research is needed.
-CRUCIAL: Keep ALL [[REF_n]] and [[TERM_n]] placeholders exactly as-is.
-Output ONLY the translated English text.`, env.DEEPSEEK_API_KEY);
+      // Academic: 2-step — rewrite with high-burstiness prompt, then enrich citations
+      const rewritten = await callDeepSeek(
+        processedText,
+        `You are a careful editor. Rewrite the following text to make it sound naturally human-written, in professional academic English.
+
+Rules:
+- Keep ALL placeholders like [[REF_n]] and [[TERM_n]] EXACTLY as they appear. Do NOT translate, change, or remove them.
+- Preserve the original meaning completely.
+- Vary sentence length: mix short punchy sentences with longer flowing ones.
+- Use precise, varied vocabulary. AVOID these AI clichés: delve, testament, comprehensive, intricate, showcases, multifaceted, it is worth noting, in conclusion, furthermore, moreover, additionally.
+- Output ONLY the rewritten text. No preamble, no explanation, no labels.`,
+        env.DEEPSEEK_API_KEY
+      );
+      return restoreTerms(rewritten, protectedMap);
     } else if (mode === "creative") {
-      // Creative: EN → FI → EN via DeepSeek
-      const fi = await callDeepSeek(result, "Translate to Finnish (suomi). PRESERVE all placeholders exactly.", env.DEEPSEEK_API_KEY);
-      result = await callDeepSeek(fi, `Task: Translate to English with HIGH CREATIVITY. Vary sentence length, use unexpected word choices, avoid repetition.
-Avoid AI clichés: delve, testament, comprehensive, intricate, showcases.
-Output ONLY the translated English text.`, env.DEEPSEEK_API_KEY);
+      // Creative: rewrite with creativity / voice
+      const rewritten = await callDeepSeek(
+        processedText,
+        `You are a creative writing editor. Rewrite the following text to sound expressive, vivid, and naturally human.
+
+Rules:
+- Keep ALL placeholders like [[REF_n]] and [[TERM_n]] EXACTLY as they appear. Do NOT translate, change, or remove them.
+- Vary sentence rhythm dramatically — short sentences for impact, longer ones for flow.
+- Use unexpected word choices, vivid imagery, concrete language.
+- AVOID these AI clichés: delve, testament, comprehensive, intricate, showcases, furthermore, moreover.
+- Output ONLY the rewritten text. No preamble, no explanation, no labels.`,
+        env.DEEPSEEK_API_KEY
+      );
+      return restoreTerms(rewritten, protectedMap);
     } else {
-      // Standard: EN → CN → EN
-      const cn = await callDeepSeek(result, "Translate to Chinese naturally. Keep placeholders as-is.", env.DEEPSEEK_API_KEY);
-      result = await callDeepSeek(cn, "Translate back to English. Make it sound genuinely human-written. Avoid AI clichés.", env.DEEPSEEK_API_KEY);
+      // Standard: clean rewrite, same language as input
+      const rewritten = await callDeepSeek(
+        processedText,
+        `You are a writing editor. Rewrite the following text in the SAME language to make it sound naturally human-written.
+
+Rules:
+- Keep ALL placeholders like [[REF_n]] and [[TERM_n]] EXACTLY as they appear. Do NOT translate, change, or remove them.
+- Preserve the original meaning.
+- Vary sentence length naturally.
+- Use clear, varied vocabulary. AVOID these AI clichés: delve, testament, comprehensive, intricate, showcases, furthermore, moreover, in conclusion.
+- Output ONLY the rewritten text. No preamble, no explanation, no labels.`,
+        env.DEEPSEEK_API_KEY
+      );
+      return restoreTerms(rewritten, protectedMap);
     }
-    return restoreTerms(result, protectedMap);
   } catch (error) {
     throw new Error(`Humanization failed: ${error instanceof Error ? error.message : String(error)}`);
   }
@@ -462,6 +483,7 @@ export default {
 
     // ===== POST /humanize =====
     if (url.pathname === "/humanize" && request.method === "POST") {
+      const t0 = Date.now();
       const ip = request.headers.get("CF-Connecting-IP") || "unknown";
       const rl = checkRateLimit(ip);
       if (!rl.allowed) {
@@ -483,10 +505,16 @@ export default {
         if (!env.DEEPSEEK_API_KEY) {
           return jsonResponse({ error: "Service temporarily unavailable: DeepSeek API key not configured.", hint: "Set DEEPSEEK_API_KEY via `wrangler secret put DEEPSEEK_API_KEY`" }, 503, origin, env);
         }
+        const t1 = Date.now();
         const humanized = await humanizePipeline(text, mode, env);
+        const t2 = Date.now();
         const score = env.HUGGINGFACE_API_KEY ? await getAIScore(humanized, env.HUGGINGFACE_API_KEY) : null;
+        const t3 = Date.now();
+        console.log(`[humanize] mode=${mode} words=${wordCount} parse=${t1-t0}ms pipeline=${t2-t1}ms score=${t3-t2}ms total=${t3-t0}ms`);
         return jsonResponse({ result: humanized, aiScore: score !== null ? `${(score * 100).toFixed(1)}%` : "N/A", originalWordCount: wordCount, remaining: rl.remaining }, 200, origin, env);
       } catch (error) {
+        const t = Date.now() - t0;
+        console.error(`[humanize] FAILED after ${t}ms:`, error);
         return jsonResponse({ error: error instanceof Error ? error.message : "Internal error" }, 500, origin, env);
       }
     }
