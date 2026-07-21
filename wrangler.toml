@@ -7,7 +7,7 @@ compatibility_flags = ["nodejs_compat"]
 [vars]
 ALLOWED_ORIGIN = "https://bodyscore.me"
 ENVIRONMENT = "production"
-PAYPAL_ENV = "sandbox"
+PAYPAL_ENV = "live"
 
 # Extra allowed origins (comma-separated). Keep in sync with CF Pages custom domains.
 EXTRA_ALLOWED_ORIGINS = "https://bypass-ai.pages.dev,https://www.bodyscore.me"
@@ -16,8 +16,8 @@ EXTRA_ALLOWED_ORIGINS = "https://bypass-ai.pages.dev,https://www.bodyscore.me"
 PAYPAL_RETURN_URL = "https://bodyscore.me/billing/success"
 PAYPAL_CANCEL_URL = "https://bodyscore.me/billing/cancel"
 
-PAYPAL_PLAN_PRO = "P-9H8685126A247253XNJOLYFI"
-PAYPAL_PLAN_ACADEMIC = "P-16D99338NM5834927NJOLYFI"
+PAYPAL_PLAN_PRO = "P-3KN886181G369362GNJPSUJY"
+PAYPAL_PLAN_ACADEMIC = "P-05K3219623209280MNJPSUJY"
 PAYPAL_WEBHOOK_ID = "1K741337DT3618449"
 
 # Creem (LIVE mode)
