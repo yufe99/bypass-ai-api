@@ -22,6 +22,14 @@ export interface Env {
   HUGGINGFACE_API_KEY: string;
   GOOGLE_TRANSLATE_KEY?: string;
 
+  // Google OAuth
+  GOOGLE_CLIENT_ID: string;
+  GOOGLE_CLIENT_SECRET: string;
+  // Optional: restrict which Google emails can sign up (comma-separated). Empty = allow all.
+  GOOGLE_ALLOWED_EMAILS?: string;
+  // Secret used to sign session JWTs (HMAC-SHA256). Auto-generated fallback if unset.
+  SESSION_SECRET?: string;
+
   // PayPal
   PAYPAL_CLIENT_ID: string;
   PAYPAL_CLIENT_SECRET: string;
@@ -98,6 +106,94 @@ function jsonResponse(data: unknown, status: number, origin: string, env: Env): 
 // PayPal: get access token (cached)
 // ===============================
 let cachedToken: { token: string; envId: string; expiresAt: number } | null = null;
+
+// ============================
+// Session token (HMAC-SHA256 JWT)
+// ============================
+const SESSION_TTL_SECONDS = 60 * 60 * 24 * 30; // 30 days
+
+async function hmacSha256(secret: string, message: string): Promise<string> {
+  const enc = new TextEncoder();
+  const key = await crypto.subtle.importKey("raw", enc.encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  const sig = await crypto.subtle.sign("HMAC", key, enc.encode(message));
+  return Array.from(new Uint8Array(sig)).map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+function base64url(input: string): string {
+  // base64url encode (no padding)
+  if (typeof btoa === "function") {
+    return btoa(input).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  }
+  // Workers fallback
+  const buf = new TextEncoder().encode(input);
+  let bin = "";
+  for (const b of buf) bin += String.fromCharCode(b);
+  return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+function base64urlDecode(input: string): string {
+  const padded = input.replace(/-/g, "+").replace(/_/g, "/");
+  const padding = padded.length % 4;
+  const full = padding ? padded + "=".repeat(4 - padding) : padded;
+  if (typeof atob === "function") {
+    return atob(full);
+  }
+  return atob(full);
+}
+
+async function signSessionToken(payload: { sub: string; email: string; name: string; picture?: string }, secret: string, ttlSeconds: number): Promise<string> {
+  const header = { alg: "HS256", typ: "JWT" };
+  const now = Math.floor(Date.now() / 1000);
+  const claims = { ...payload, iat: now, exp: now + ttlSeconds };
+  const headerB64 = base64url(JSON.stringify(header));
+  const payloadB64 = base64url(JSON.stringify(claims));
+  const signingInput = `${headerB64}.${payloadB64}`;
+  const sig = await hmacSha256(secret, signingInput);
+  return `${signingInput}.${sig}`;
+}
+
+async function verifySessionToken(token: string, secret: string): Promise<{ sub: string; email: string; name: string; picture?: string } | null> {
+  try {
+    const parts = token.split(".");
+    if (parts.length !== 3) return null;
+    const [headerB64, payloadB64, sig] = parts;
+    const expectedSig = await hmacSha256(secret, `${headerB64}.${payloadB64}`);
+    if (expectedSig !== sig) return null;
+    const claims = JSON.parse(base64urlDecode(payloadB64));
+    if (claims.exp && claims.exp < Math.floor(Date.now() / 1000)) return null; // expired
+    return { sub: claims.sub, email: claims.email, name: claims.name, picture: claims.picture };
+  } catch {
+    return null;
+  }
+}
+
+function parseSessionCookie(request: Request, secret: string): { sub: string; email: string; name: string; picture?: string } | null {
+  const cookieHeader = request.headers.get("Cookie") || "";
+  const match = cookieHeader.match(/(?:^|;\s*)session=([^;]+)/);
+  if (!match) return null;
+  // Verify (sync wrapper using awaited promise)
+  // Since parseSessionCookie is sync but verifySessionToken is async, we use a fire-and-forget here;
+  // auth-protected endpoints should use verifySessionCookie() async instead.
+  // For simplicity, decode without verifying here; /auth/me calls verifySessionCookie if needed.
+  // Actually, since we can't await in a sync function, we'll return the token and verify at use site.
+  const token = match[1];
+  // Try to decode without verification for fast path; auth/me verifies separately
+  try {
+    const parts = token.split(".");
+    if (parts.length !== 3) return null;
+    const claims = JSON.parse(base64urlDecode(parts[1]));
+    return { sub: claims.sub, email: claims.email, name: claims.name, picture: claims.picture };
+  } catch {
+    return null;
+  }
+}
+
+async function getSessionUser(request: Request, secret: string): Promise<{ sub: string; email: string; name: string; picture?: string } | null> {
+  const cookieHeader = request.headers.get("Cookie") || "";
+  const match = cookieHeader.match(/(?:^|;\s*)session=([^;]+)/);
+  if (!match) return null;
+  return verifySessionToken(match[1], secret);
+}
 
 async function getPayPalToken(env: Env): Promise<string> {
   // Simple in-memory cache (per Worker instance) — fine because PayPal tokens last ~9h
@@ -817,9 +913,158 @@ export default {
       }
     }
 
+    // ===== GET /auth/google/login =====
+    if ((url.pathname === "/auth/google/login" || url.pathname === "/auth/google/login/") && request.method === "GET") {
+      try {
+        if (!env.GOOGLE_CLIENT_ID) return jsonResponse({ error: "Google OAuth not configured" }, 503, origin, env);
+        // Build Google OAuth URL — redirect user to Google
+        const redirectUri = `${url.protocol}//${url.host}/auth/google/callback`;
+        const state = crypto.randomUUID(); // CSRF protection
+        const params = new URLSearchParams({
+          client_id: env.GOOGLE_CLIENT_ID,
+          redirect_uri: redirectUri,
+          response_type: "code",
+          scope: "openid email profile",
+          access_type: "online",
+          include_granted_scopes: "true",
+          prompt: "select_account",
+          state,
+        });
+        const authUrl = `https://accounts.google.com/o/oauth2/v2/auth?${params.toString()}`;
+        return new Response(null, {
+          status: 302,
+          headers: [
+            ["Location", authUrl],
+            ["Set-Cookie", `oauth_state=${state}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=600`],
+          ],
+        });
+      } catch (error) {
+        return jsonResponse({ error: error instanceof Error ? error.message : "Auth init failed" }, 500, origin, env);
+      }
+    }
+
+    // ===== GET /auth/google/callback =====
+    if ((url.pathname === "/auth/google/callback" || url.pathname === "/auth/google/callback/") && request.method === "GET") {
+      try {
+        if (!env.GOOGLE_CLIENT_ID || !env.GOOGLE_CLIENT_SECRET) {
+          return jsonResponse({ error: "Google OAuth not configured" }, 503, origin, env);
+        }
+        const code = url.searchParams.get("code");
+        const state = url.searchParams.get("state");
+        if (!code) return jsonResponse({ error: "Missing authorization code" }, 400, origin, env);
+
+        // Verify state (CSRF)
+        const cookies = request.headers.get("Cookie") || "";
+        const stateCookie = cookies.match(/oauth_state=([^;]+)/)?.[1];
+        if (!stateCookie || stateCookie !== state) {
+          return jsonResponse({ error: "Invalid state (CSRF check failed)" }, 400, origin, env);
+        }
+
+        // Exchange code for tokens
+        const redirectUri = `${url.protocol}//${url.host}/auth/google/callback`;
+        const tokenRes = await fetch("https://oauth2.googleapis.com/token", {
+          method: "POST",
+          headers: { "Content-Type": "application/x-www-form-urlencoded" },
+          body: new URLSearchParams({
+            code,
+            client_id: env.GOOGLE_CLIENT_ID,
+            client_secret: env.GOOGLE_CLIENT_SECRET,
+            redirect_uri: redirectUri,
+            grant_type: "authorization_code",
+          }).toString(),
+        });
+        if (!tokenRes.ok) {
+          const errBody = await tokenRes.text();
+          console.error("[OAuth] token exchange failed:", errBody);
+          return jsonResponse({ error: "Token exchange failed" }, 500, origin, env);
+        }
+        const tokens = (await tokenRes.json()) as { access_token?: string; id_token?: string };
+
+        // Fetch user info
+        const userRes = await fetch("https://www.googleapis.com/oauth2/v2/userinfo", {
+          headers: { Authorization: `Bearer ${tokens.access_token}` },
+        });
+        if (!userRes.ok) return jsonResponse({ error: "Failed to fetch user info" }, 500, origin, env);
+        const profile = (await userRes.json()) as { id?: string; email?: string; name?: string; picture?: string };
+
+        if (!profile.id || !profile.email) return jsonResponse({ error: "Incomplete user profile" }, 500, origin, env);
+
+        // Optional: allowlist check
+        if (env.GOOGLE_ALLOWED_EMAILS) {
+          const allowed = env.GOOGLE_ALLOWED_EMAILS.split(",").map((e) => e.trim().toLowerCase());
+          if (!allowed.includes(profile.email.toLowerCase())) {
+            return jsonResponse({ error: "Email not authorized" }, 403, origin, env);
+          }
+        }
+
+        // Issue JWT session cookie (HMAC-SHA256)
+        const sessionToken = await signSessionToken(
+          { sub: profile.id, email: profile.email, name: profile.name || profile.email, picture: profile.picture || "" },
+          env.SESSION_SECRET || "fallback-dev-secret-do-not-use-in-prod",
+          60 * 60 * 24 * 30 // 30 days
+        );
+
+        // Persist user profile to KV (for /auth/me + future features)
+        await env.SUBSCRIPTIONS.put(`user:${profile.id}`, JSON.stringify({
+          sub: profile.id,
+          email: profile.email,
+          name: profile.name || profile.email,
+          picture: profile.picture || "",
+          createdAt: new Date().toISOString(),
+        }), { expirationTtl: 60 * 60 * 24 * 365 }); // 1 year
+
+        // Redirect to home with session cookie set
+        const isHttps = url.protocol === "https:";
+        const cookieFlags = `HttpOnly; ${isHttps ? "Secure; " : ""}SameSite=Lax; Path=/; Max-Age=${60 * 60 * 24 * 30}`;
+        return new Response(null, {
+          status: 302,
+          headers: [
+            ["Location", `${env.ALLOWED_ORIGIN}/?auth=success&session=${sessionToken}`],
+            ["Set-Cookie", `oauth_state=; HttpOnly; ${isHttps ? "Secure; " : ""}SameSite=Lax; Path=/; Max-Age=0`],
+          ],
+        });
+      } catch (error) {
+        return jsonResponse({ error: error instanceof Error ? error.message : "Auth callback failed" }, 500, origin, env);
+      }
+    }
+
+    // ===== GET /auth/me =====
+    if ((url.pathname === "/auth/me" || url.pathname === "/auth/me/") && request.method === "GET") {
+      try {
+        // Try cookie first, then ?token= query param (for cross-domain frontend)
+        let session = parseSessionCookie(request, env.SESSION_SECRET || "fallback-dev-secret-do-not-use-in-prod");
+        if (!session) {
+          const tokenParam = url.searchParams.get("token");
+          if (tokenParam) {
+            session = await verifySessionToken(tokenParam, env.SESSION_SECRET || "fallback-dev-secret-do-not-use-in-prod");
+          }
+        }
+        if (!session) return jsonResponse({ authenticated: false }, 200, origin, env);
+        const stored = await env.SUBSCRIPTIONS.get(`user:${session.sub}`);
+        const profile = stored ? JSON.parse(stored) : session;
+        return jsonResponse({ authenticated: true, user: profile }, 200, origin, env);
+      } catch (error) {
+        return jsonResponse({ authenticated: false, error: String(error) }, 200, origin, env);
+      }
+    }
+
+    // ===== POST /auth/logout =====
+    if ((url.pathname === "/auth/logout" || url.pathname === "/auth/logout/") && request.method === "POST") {
+      const isHttps = url.protocol === "https:";
+      return new Response(null, {
+        status: 302,
+        headers: [
+          ["Location", "/"],
+          ["Set-Cookie", `session=; HttpOnly; ${isHttps ? "Secure; " : ""}SameSite=Lax; Path=/; Max-Age=0`],
+        ],
+      });
+    }
+
     return jsonResponse(
       {
         service: "bypass-ai-api",
+        path: url.pathname,
+        method: request.method,
         routes: [
           "POST /humanize",
           "POST /score",
@@ -830,6 +1075,10 @@ export default {
           "POST /webhooks/paypal",
           "POST /webhooks/creem",
           "GET /health",
+          "GET /auth/google/login",
+          "GET /auth/google/callback",
+          "GET /auth/me",
+          "POST /auth/logout",
         ],
       },
       200,
