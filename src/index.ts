@@ -81,8 +81,10 @@ const SUBSCRIPTION_TTL_SECONDS = 90 * 24 * 60 * 60;
 // ===============================
 // CORS
 // ===============================
-function corsHeaders(origin: string, allowed: string): HeadersInit {
-  const allowOrigin = origin === allowed ? origin : allowed;
+function corsHeaders(origin: string, allowed: string, extraOrigins?: string): HeadersInit {
+  const extras = extraOrigins ? extraOrigins.split(",").map((o) => o.trim()).filter(Boolean) : [];
+  const allAllowed = [allowed, ...extras];
+  const allowOrigin = allAllowed.includes(origin) ? origin : allowed;
   return {
     "Access-Control-Allow-Origin": allowOrigin,
     "Access-Control-Allow-Methods": "POST, GET, OPTIONS",
@@ -97,7 +99,7 @@ function jsonResponse(data: unknown, status: number, origin: string, env: Env): 
     status,
     headers: {
       "Content-Type": "application/json",
-      ...corsHeaders(origin, env.ALLOWED_ORIGIN),
+      ...corsHeaders(origin, env.ALLOWED_ORIGIN, env.EXTRA_ALLOWED_ORIGINS),
     },
   });
 }
@@ -511,7 +513,7 @@ export default {
     const url = new URL(request.url);
 
     if (request.method === "OPTIONS") {
-      return new Response(null, { status: 204, headers: corsHeaders(origin, env.ALLOWED_ORIGIN) });
+      return new Response(null, { status: 204, headers: corsHeaders(origin, env.ALLOWED_ORIGIN, env.EXTRA_ALLOWED_ORIGINS) });
     }
 
     if (url.pathname === "/health") {

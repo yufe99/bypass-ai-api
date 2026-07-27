@@ -5,16 +5,16 @@ compatibility_flags = ["nodejs_compat"]
 
 # CORS allowed origin
 [vars]
-ALLOWED_ORIGIN = "https://bodyscore.me"
+ALLOWED_ORIGIN = "https://bypassai.online"
 ENVIRONMENT = "production"
 PAYPAL_ENV = "live"
 
 # Extra allowed origins (comma-separated). Keep in sync with CF Pages custom domains.
-EXTRA_ALLOWED_ORIGINS = "https://bypass-ai.pages.dev,https://www.bodyscore.me"
+EXTRA_ALLOWED_ORIGINS = "https://bypass-ai.pages.dev,https://www.bypassai.online,https://www.bodyscore.me"
 
 # PayPal return/cancel URLs after checkout — point to production domain
-PAYPAL_RETURN_URL = "https://bodyscore.me/billing/success"
-PAYPAL_CANCEL_URL = "https://bodyscore.me/billing/cancel"
+PAYPAL_RETURN_URL = "https://bypassai.online/billing/success"
+PAYPAL_CANCEL_URL = "https://bypassai.online/billing/cancel"
 
 PAYPAL_PLAN_PRO = "P-3KN886181G369362GNJPSUJY"
 PAYPAL_PLAN_ACADEMIC = "P-05K3219623209280MNJPSUJY"
@@ -24,8 +24,8 @@ PAYPAL_WEBHOOK_ID = "15E55721EC595101E"
 CREEM_ENV = "live"
 CREEM_PRODUCT_PRO = "prod_4CW1jAmXv9F2C4WRyf6UWq"
 CREEM_PRODUCT_ACADEMIC = "prod_SjtUpeEmjLBTxzv6wnHzd"
-CREEM_SUCCESS_URL = "https://bodyscore.me/billing/success"
-CREEM_CANCEL_URL = "https://bodyscore.me/billing/cancel"
+CREEM_SUCCESS_URL = "https://bypassai.online/billing/success"
+CREEM_CANCEL_URL = "https://bypassai.online/billing/cancel"
 
 [[kv_namespaces]]
 binding = "SUBSCRIPTIONS"
